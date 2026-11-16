@@ -204,12 +204,13 @@ Consequences:
 * **Polars streaming is used for every aggregate.**  No Pandas conversion and
   no per-row Python loop over the data.  The final count table is converted to
   per-node NumPy count arrays.
-* **Scan budget = 1 + tree depth (+1 for pruning).**  The root scan discovers
-  classes and reads only the target column; each level adds one full scan of
-  the feature+target projection.  `max_depth` is therefore an I/O knob: a
-  depth-3 tree needs 4 logical scans at any row count, while an unbounded,
-  deeper tree adds a full pass per level.  `clf.scan_counts_` reports the
-  actual training scans.
+* **Scan budget = root scan + one scan per attempted level (+1 for pruning).**
+  The root scan discovers classes and reads only the target column; each level
+  adds one full scan of the feature+target projection.  A tree of depth `d`
+  normally uses `1 + d` logical scans, but can use `1 + d + 1` when the final
+  attempted level finds no valid split.  `max_depth` is therefore an I/O knob:
+  capping depth caps attempted levels, while an unbounded deeper tree adds a
+  pass per level.  `clf.scan_counts_` reports the exact training scans.
 * **Prediction is lazy** and can be sunk directly to parquet, so predictions
   also need not fit in memory.
 * **Pruning is optional** and adds one validation scan (except when the tree is
@@ -258,11 +259,15 @@ On a 1 GB dataset (8M rows, 8 low-cardinality categorical features):
 A target-only aggregation alone peaks at ~126 MB with one thread, which puts a
 100 MB cap below the runtime floor.  For single-file data, peak RSS stayed
 roughly flat from 1 GB to 8 GB (312–351 MB) while fit time grew 8× (4.6 s →
-37.8 s).  A proper 80/20 holdout on the 1 GB data scored 0.7379 versus 0.7387
-on the training split (gap 0.0008).  Training always reported 4 logical scans: 1 target-only root scan + 3
-level scans.  The scan count is independent of row count and node count, but
-each level scan reads the whole feature+target projection, so I/O and time grow
-linearly with database size (and one extra full pass per extra tree level).
+37.8 s).  A 1 GB 80/20 holdout scored **0.7975** on both train and test with
+`min_samples_leaf=10_000` (gap 0.0, the Bayes ceiling of the synthetic
+generator); the more conservative `min_samples_leaf=50_000` run scored 0.7387
+train / 0.7379 holdout, a 0.0008 gap.  In the fixed `max_depth=3` scaling runs
+the training scan count was always 4; the accuracy-tuned run needed 5 because a
+final attempted level found no split.  The scan count is independent of row
+count and node count, but each level scan reads the whole feature+target
+projection, so I/O and time grow linearly with database size (and one extra
+full pass per extra attempted level).
 Full methodology, scan/I/O extrapolations and caveats are in
 [MEMORY.md](MEMORY.md).
 
@@ -287,7 +292,7 @@ The test suite covers:
 * lazy prediction and `sink_parquet`,
 * independent train/test holdout accuracy (not only re-scoring training rows),
 * rule export and input validation,
-* one level scan per depth (instrumented test), with `scan_counts_`.
+* one scan per attempted level (instrumented test), with `scan_counts_`.
 
 ## License
 

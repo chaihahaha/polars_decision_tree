@@ -13,8 +13,9 @@ The short answers:
   with the tuned configuration.  The working set is dominated by Python +
   Polars and the current tree's contingency table, not by the number of rows.
 * **The number of scans does not grow with row count when the tree depth is
-  capped.**  The measured count was exactly 4 scans (1 root class scan + 3
-  levels) at 1, 2, 4 and 8 GB.
+  capped.**  The fixed `max_depth=3` scaling runs used exactly 4 scans (1 root
+  class scan + 3 levels) at 1, 2, 4 and 8 GB.  A final failed expansion attempt
+  can add one more scan; an accuracy-tuned run used 5 for a depth-3 tree.
 * **Total I/O still grows linearly with database size**, because every level
   scans the whole feature+target projection (the root class scan reads only the
   target column).  Time therefore grows linearly for a fixed tree.
@@ -95,10 +96,14 @@ clf.scan_counts_
 
 For a tree of depth `d` without pruning:
 
-* 1 full target-column scan to discover classes and root counts,
-* `d` full scans, one per level,
-* 0 validation scans,
-* total `1 + d`.
+* 1 target-column scan to discover classes and root counts,
+* one full feature+target scan per **attempted** level,
+* usually `d` level scans, but `d + 1` if the builder scans a final level and
+  then finds no valid split (a failed expansion attempt),
+* 0 validation scans.
+
+`scan_counts_` reports the actual split into `root`, `level`, `validation` and
+`total`; use it rather than assuming an exact formula.
 
 With `prune=True` and `eval_path`, add one validation scan.  If the root itself
 is a leaf, there are no level scans.  Scoring performs one additional pass over
@@ -151,17 +156,32 @@ the training rows.  A proper held-out check was added as well:
 | Scans | 4 |
 
 The tiny gap shows the tree is not memorising the training rows.  The absolute
-value is modest because this synthetic generator is noisy; its Bayes-optimal
-accuracy is about 0.797.  The larger 2–8 GB runs reached 0.7975 training
-accuracy, i.e. the Bayes ceiling, once enough rows made more categories eligible
-under `min_samples_leaf=50_000`.  The 1 GB model underfits relative to that
-ceiling, which is why its accuracy is lower; this is a data/threshold effect,
-not a held-out overfitting effect.
+value is modest because the conservative memory setting (`min_samples_leaf=50_000`)
+underfits this noisy generator; its Bayes-optimal accuracy is about 0.797.
+
+Re-running the same split with more granular leaves (`min_samples_leaf=10_000`,
+`min_samples_split=20_000`, `max_depth=5`) gives:
+
+| Metric | Value |
+| --- | ---: |
+| Training accuracy | 0.7975 |
+| Held-out accuracy | 0.7975 |
+| Train–test gap | 0.0000 |
+| Tree | depth 3, 220 leaves |
+| Peak RSS | 338.7 MB |
+| Training scans | 5 (1 root + 4 level scans) |
+
+Both training and holdout reach the Bayes ceiling of this synthetic generator.
+The fifth training scan is a **failed expansion attempt**: after the third level,
+the remaining frontier was still large enough to test, so the builder scanned one
+more level and found no split.  This is why the scan count is not always exactly
+`1 + tree_depth`; `scan_counts_` reports the actual attempted levels.
 
 The pytest suite also contains an independent train/test generalization test on
-a noisier synthetic concept; it asserts test accuracy above 0.85 and a small
-train–test gap.  Existing tests additionally assert exact accuracies (0.625,
-0.9, 1.0, etc.) for known small trees and pruning outcomes.
+a noisier synthetic concept: 0.9211 training vs 0.9197 held-out accuracy
+(majority baseline 0.7858, gap 0.0014).  Existing tests additionally assert
+exact accuracies (0.625, 0.9, 1.0, etc.) for known small trees and pruning
+outcomes.
 
 ## File-count is a separate memory axis
 
